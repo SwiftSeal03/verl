@@ -691,6 +691,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 for name, param in params.items()
             )
 
+            l1 = [(name, param._local_tensor.shape, param.device_mesh, param.placements) for name, param in params.items() if isinstance(param, DTensor)]
+            l2 = [(name, param.shape) for name, param in per_tensor_param]
+            print(l1[:5], l2[:5])
+
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
@@ -887,6 +891,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"), blocking=False)
+    @DistProfiler.annotate(color="red", role="actor_update")
+    def update_actor_async(self, data: DataProto):
+        return self.update_actor(data)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
@@ -1499,6 +1508,11 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         output = output.to("cpu")
         return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"), blocking=False)
+    @DistProfiler.annotate(color="pink")
+    def update_critic_async(self, data: DataProto):
+        return self.update_critic(data)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

@@ -728,6 +728,8 @@ class RayPPOTrainer:
                 )
         wg_kwargs["device_name"] = self.device_name
 
+        print("\n\n\nBefore spawn workers\n\n\n")
+
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(
@@ -738,6 +740,8 @@ class RayPPOTrainer:
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
 
+        print("\n\n\nAfter spawn workers\n\n\n")
+
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
             self.critic_wg.init_model()
@@ -745,6 +749,8 @@ class RayPPOTrainer:
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
+
+        print("\n\n\nAfter init critic and ref policy\n\n\n")
 
         self.rm_wg = None
         if self.use_rm:
@@ -754,6 +760,8 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
+
+        print("\n\n\nAfter init actor rollout\n\n\n")
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -1016,7 +1024,9 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for i, batch_dict in enumerate(self.train_dataloader):
+                if i >= 5:
+                    break
                 metrics = {}
                 timing_raw = {}
 
@@ -1173,26 +1183,40 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                    if len(self.resource_pool_manager.resource_pool_dict) == 1:
+                        # update critic
+                        if self.use_critic:
+                            with marked_timer("update_critic", timing_raw, color="pink"):
+                                critic_output = self.critic_wg.update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
+
+                        # implement critic warmup
+                        if self.config.trainer.critic_warmup <= self.global_steps:
+                            # update actor
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
+
+                        # Log rollout generations if enabled
+                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if rollout_data_dir:
+                            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    else:
+                        # update critic and actor asynchronously
+                        with marked_timer("update_critic_actor", timing_raw, color="pink"):
+                            critic_output = self.critic_wg.update_critic_async(batch)
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                            actor_output = self.actor_rollout_wg.update_actor_async(batch)
+                            critic_output = critic_output.get()
+                            actor_output = actor_output.get()
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            metrics.update(critic_output_metrics)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
 
                 # validate
                 if (
